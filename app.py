@@ -103,7 +103,7 @@ def get_financial_data(ticker_symbol):
                 values.append(format_pct(val, r["revenue"]))
             else:
                 values.append(format_number(val))
-        return {"label": label, "values": values, "css_class": css_class}
+        return {"label": label, "cells": values, "css_class": css_class}
 
     financial_data = [
         build_row("Ingresos totales", "Total Revenue", css_class="subtotal", show_pct=False),
@@ -226,7 +226,7 @@ def create_word_document(company_name, ticker_symbol, memo_text, financial_data,
     for row_data in financial_data:
         row_cells = table.add_row().cells
         row_cells[0].text = row_data["label"]
-        for i, val in enumerate(row_data["values"]):
+        for i, val in enumerate(row_data["cells"]):
             text = val["formatted"]
             if val["pct"] is not None:
                 text += f" {val['pct']}"
