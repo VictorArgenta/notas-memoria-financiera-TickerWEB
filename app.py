@@ -5,7 +5,6 @@ from datetime import datetime
 
 import anthropic
 import yfinance as yf
-from yfinance.config import YfConfig
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -13,10 +12,6 @@ from dotenv import load_dotenv
 from flask import Flask, render_template, request, send_file
 
 load_dotenv()
-
-# Disable yfinance silent exception hiding so network/auth errors propagate
-# instead of returning empty DataFrames with no explanation.
-YfConfig.debug.hide_exceptions = False
 
 app = Flask(__name__)
 
@@ -54,44 +49,35 @@ def safe_get(df, key, col):
 
 
 def _fetch_income_stmt(ticker):
-    """Try multiple yfinance methods to obtain the income statement DataFrame."""
-    # Method 1: income_stmt property (pretty=True, human-readable index)
-    try:
-        stmt = ticker.income_stmt
-        if stmt is not None and not stmt.empty:
-            return stmt
-    except Exception:
-        pass
+    """Try multiple yfinance methods to obtain the income statement DataFrame.
 
-    # Method 2: get_income_stmt with pretty=False (camelCase index)
-    try:
-        stmt = ticker.get_income_stmt(pretty=False)
-        if stmt is not None and not stmt.empty:
-            return stmt
-    except Exception:
-        pass
+    Raises RuntimeError with the underlying cause when all methods fail.
+    """
+    last_error = None
 
-    # Method 3: financials property (alias, may use different cache path)
-    try:
-        stmt = ticker.financials
-        if stmt is not None and not stmt.empty:
-            return stmt
-    except Exception:
-        pass
+    for fetch in [
+        lambda: ticker.income_stmt,
+        lambda: ticker.get_income_stmt(pretty=False),
+        lambda: ticker.financials,
+    ]:
+        try:
+            stmt = fetch()
+            if stmt is not None and not stmt.empty:
+                return stmt
+        except Exception as exc:
+            last_error = exc
 
-    return None
+    detail = f" ({last_error})" if last_error else ""
+    raise RuntimeError(
+        f"No se pudieron obtener datos financieros para '{ticker.ticker}'. "
+        f"Verifica que el ticker sea correcto y que haya conexion a Internet.{detail}"
+    )
 
 
 def get_financial_data(ticker_symbol):
     """Download and process financial data from Yahoo Finance."""
     ticker = yf.Ticker(ticker_symbol)
     income_stmt = _fetch_income_stmt(ticker)
-
-    if income_stmt is None:
-        raise RuntimeError(
-            f"No se pudieron obtener datos financieros para '{ticker_symbol}'. "
-            "Verifica que el ticker sea correcto y que haya conexion a Internet."
-        )
 
     try:
         info = ticker.info
