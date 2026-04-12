@@ -5,6 +5,7 @@ from datetime import datetime
 
 import anthropic
 import yfinance as yf
+from yfinance.config import YfConfig
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -12,6 +13,10 @@ from dotenv import load_dotenv
 from flask import Flask, render_template, request, send_file
 
 load_dotenv()
+
+# Disable yfinance silent exception hiding so network/auth errors propagate
+# instead of returning empty DataFrames with no explanation.
+YfConfig.debug.hide_exceptions = False
 
 app = Flask(__name__)
 
@@ -48,15 +53,50 @@ def safe_get(df, key, col):
         return None
 
 
+def _fetch_income_stmt(ticker):
+    """Try multiple yfinance methods to obtain the income statement DataFrame."""
+    # Method 1: income_stmt property (pretty=True, human-readable index)
+    try:
+        stmt = ticker.income_stmt
+        if stmt is not None and not stmt.empty:
+            return stmt
+    except Exception:
+        pass
+
+    # Method 2: get_income_stmt with pretty=False (camelCase index)
+    try:
+        stmt = ticker.get_income_stmt(pretty=False)
+        if stmt is not None and not stmt.empty:
+            return stmt
+    except Exception:
+        pass
+
+    # Method 3: financials property (alias, may use different cache path)
+    try:
+        stmt = ticker.financials
+        if stmt is not None and not stmt.empty:
+            return stmt
+    except Exception:
+        pass
+
+    return None
+
+
 def get_financial_data(ticker_symbol):
     """Download and process financial data from Yahoo Finance."""
     ticker = yf.Ticker(ticker_symbol)
-    income_stmt = ticker.income_stmt
+    income_stmt = _fetch_income_stmt(ticker)
 
-    if income_stmt is None or income_stmt.empty:
-        return None, None, None, None
+    if income_stmt is None:
+        raise RuntimeError(
+            f"No se pudieron obtener datos financieros para '{ticker_symbol}'. "
+            "Verifica que el ticker sea correcto y que haya conexion a Internet."
+        )
 
-    info = ticker.info
+    try:
+        info = ticker.info
+    except Exception:
+        info = {}
     company_name = info.get("longName") or info.get("shortName") or ticker_symbol.upper()
     company_info = {
         "sector": info.get("sector", "N/D"),
@@ -67,17 +107,21 @@ def get_financial_data(ticker_symbol):
     columns = income_stmt.columns[:4]
     years = [col.strftime("%Y") if hasattr(col, "strftime") else str(col) for col in columns]
 
+    # Map display labels to possible index names (pretty and camelCase variants)
     key_map = {
         "Total Revenue": ["Total Revenue", "TotalRevenue"],
         "Cost Of Revenue": ["Cost Of Revenue", "CostOfRevenue"],
         "Gross Profit": ["Gross Profit", "GrossProfit"],
-        "Operating Expense": ["Operating Expense", "OperatingExpense", "Total Operating Expenses"],
+        "Operating Expense": ["Operating Expense", "OperatingExpense",
+                              "Total Operating Expenses", "TotalExpenses"],
         "Operating Income": ["Operating Income", "OperatingIncome"],
-        "EBITDA": ["EBITDA", "Normalized EBITDA"],
-        "Net Income": ["Net Income", "NetIncome", "Net Income Common Stockholders"],
+        "EBITDA": ["EBITDA", "Normalized EBITDA", "NormalizedEBITDA"],
+        "Net Income": ["Net Income", "NetIncome",
+                        "Net Income Common Stockholders", "NetIncomeCommonStockholders"],
         "EBIT": ["EBIT"],
         "Interest Expense": ["Interest Expense", "InterestExpense"],
-        "Tax Provision": ["Tax Provision", "TaxProvision", "Income Tax Expense"],
+        "Tax Provision": ["Tax Provision", "TaxProvision",
+                          "Income Tax Expense", "IncomeTaxExpense"],
     }
 
     def find_key(label):
@@ -88,22 +132,20 @@ def get_financial_data(ticker_symbol):
         return None
 
     rows = []
-    for col_idx, col in enumerate(columns):
+    for col in columns:
         revenue = safe_get(income_stmt, find_key("Total Revenue"), col)
-        if col_idx == 0:
-            pass
         rows.append({"col": col, "revenue": revenue})
 
     def build_row(label, key_label, css_class="", show_pct=True):
         key = find_key(key_label)
-        values = []
+        cells = []
         for r in rows:
             val = safe_get(income_stmt, key, r["col"]) if key else None
             if show_pct:
-                values.append(format_pct(val, r["revenue"]))
+                cells.append(format_pct(val, r["revenue"]))
             else:
-                values.append(format_number(val))
-        return {"label": label, "cells": values, "css_class": css_class}
+                cells.append(format_number(val))
+        return {"label": label, "cells": cells, "css_class": css_class}
 
     financial_data = [
         build_row("Ingresos totales", "Total Revenue", css_class="subtotal", show_pct=False),
@@ -269,15 +311,7 @@ def index():
             return render_template("index.html", **context)
 
         try:
-            result = get_financial_data(ticker_symbol)
-            if result[0] is None:
-                context["error"] = (
-                    f"No se encontraron datos financieros para '{ticker_symbol}'. "
-                    "Verifica que el ticker sea correcto."
-                )
-                return render_template("index.html", **context)
-
-            financial_data, years, company_name, company_info, raw_data = result
+            financial_data, years, company_name, company_info, raw_data = get_financial_data(ticker_symbol)
             currency = company_info.get("currency", "USD")
 
             memo_raw = generate_memo(company_name, ticker_symbol, years, raw_data, currency)
