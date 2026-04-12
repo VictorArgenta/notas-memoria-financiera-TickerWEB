@@ -48,36 +48,37 @@ def safe_get(df, key, col):
         return None
 
 
-def _fetch_income_stmt(ticker):
-    """Try multiple yfinance methods to obtain the income statement DataFrame.
+def get_financial_data(ticker_symbol):
+    """Download and process financial data from Yahoo Finance."""
+    ticker = yf.Ticker(ticker_symbol)
 
-    Raises RuntimeError with the underlying cause when all methods fail.
-    """
+    # Warm up the session: a lightweight history call establishes the
+    # cookies/crumb that Yahoo Finance requires before serving fundamental
+    # data.  Without this, income_stmt / financials silently return empty
+    # DataFrames in many yfinance versions.
+    ticker.history(period="1d")
+
+    # Try income_stmt first (pretty index), fall back to financials
+    income_stmt = None
     last_error = None
-
     for fetch in [
         lambda: ticker.income_stmt,
-        lambda: ticker.get_income_stmt(pretty=False),
         lambda: ticker.financials,
     ]:
         try:
             stmt = fetch()
             if stmt is not None and not stmt.empty:
-                return stmt
+                income_stmt = stmt
+                break
         except Exception as exc:
             last_error = exc
 
-    detail = f" ({last_error})" if last_error else ""
-    raise RuntimeError(
-        f"No se pudieron obtener datos financieros para '{ticker.ticker}'. "
-        f"Verifica que el ticker sea correcto y que haya conexion a Internet.{detail}"
-    )
-
-
-def get_financial_data(ticker_symbol):
-    """Download and process financial data from Yahoo Finance."""
-    ticker = yf.Ticker(ticker_symbol)
-    income_stmt = _fetch_income_stmt(ticker)
+    if income_stmt is None:
+        detail = f" ({last_error})" if last_error else ""
+        raise RuntimeError(
+            f"No se pudieron obtener datos financieros para '{ticker_symbol}'. "
+            f"Verifica que el ticker sea correcto y que haya conexion a Internet.{detail}"
+        )
 
     try:
         info = ticker.info

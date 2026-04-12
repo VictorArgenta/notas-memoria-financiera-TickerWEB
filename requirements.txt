@@ -1,5 +1,5 @@
 flask==3.1.0
-yfinance==0.2.54
+yfinance>=0.2.36
 anthropic==0.52.0
 python-dotenv==1.1.0
 python-docx==1.1.2
