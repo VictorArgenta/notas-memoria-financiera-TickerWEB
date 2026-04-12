@@ -1,10 +1,15 @@
 import os
 import io
+import json
 import re
 import time
+import http.cookiejar
+import urllib.request
+import urllib.parse
 from datetime import datetime
 
 import anthropic
+import pandas as pd
 import yfinance as yf
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor
@@ -19,8 +24,118 @@ app = Flask(__name__)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 
+# ---------------------------------------------------------------------------
+# Yahoo Finance direct API helpers
+# ---------------------------------------------------------------------------
+
+_yahoo_crumb = None
+_yahoo_opener = None
+
+
+def _yahoo_session():
+    """Create (or reuse) an HTTP opener with Yahoo Finance cookies + crumb."""
+    global _yahoo_crumb, _yahoo_opener
+
+    if _yahoo_crumb and _yahoo_opener:
+        return _yahoo_opener, _yahoo_crumb
+
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    opener.addheaders = [
+        ("User-Agent",
+         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    ]
+
+    # 1. Hit fc.yahoo.com to set cookies (it returns a 404, that's expected)
+    try:
+        opener.open("https://fc.yahoo.com", timeout=10)
+    except Exception:
+        pass  # 404 is normal – we only need the Set-Cookie header
+
+    # 2. Fetch the crumb
+    crumb_url = "https://query2.finance.yahoo.com/v1/test/getcrumb"
+    resp = opener.open(crumb_url, timeout=10)
+    crumb = resp.read().decode("utf-8")
+
+    _yahoo_crumb = crumb
+    _yahoo_opener = opener
+    return opener, crumb
+
+
+def _fetch_income_stmt_direct(ticker_symbol):
+    """Fetch annual income statements directly from Yahoo Finance quoteSummary API.
+
+    Returns a pandas DataFrame with financial items as rows and fiscal-year
+    end dates as columns, matching the layout that yfinance produces.
+    """
+    opener, crumb = _yahoo_session()
+
+    url = (
+        f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/"
+        f"{urllib.parse.quote(ticker_symbol, safe='')}"
+        f"?modules=incomeStatementHistory"
+        f"&crumb={urllib.parse.quote(crumb, safe='')}"
+    )
+    resp = opener.open(url, timeout=15)
+    data = json.loads(resp.read().decode("utf-8"))
+
+    statements = (
+        data["quoteSummary"]["result"][0]
+        ["incomeStatementHistory"]["incomeStatementHistory"]
+    )
+
+    records = {}
+    for stmt in statements:
+        date_str = stmt["endDate"]["fmt"]           # e.g. "2024-06-30"
+        col_key = pd.Timestamp(date_str)
+        record = {}
+        for key, val in stmt.items():
+            if isinstance(val, dict) and "raw" in val:
+                record[key] = val["raw"]
+        records[col_key] = record
+
+    df = pd.DataFrame(records)
+    # Sort columns newest-first, like yfinance does
+    df = df[sorted(df.columns, reverse=True)]
+    return df
+
+
+def _fetch_company_info_direct(ticker_symbol):
+    """Fetch company profile from Yahoo Finance quoteSummary API."""
+    try:
+        opener, crumb = _yahoo_session()
+        url = (
+            f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/"
+            f"{urllib.parse.quote(ticker_symbol, safe='')}"
+            f"?modules=quoteType,summaryProfile,price"
+            f"&crumb={urllib.parse.quote(crumb, safe='')}"
+        )
+        resp = opener.open(url, timeout=15)
+        data = json.loads(resp.read().decode("utf-8"))
+        result = data["quoteSummary"]["result"][0]
+
+        price_info = result.get("price", {})
+        profile = result.get("summaryProfile", {})
+        quote_type = result.get("quoteType", {})
+
+        return {
+            "longName": price_info.get("longName") or quote_type.get("longName"),
+            "shortName": price_info.get("shortName") or quote_type.get("shortName"),
+            "sector": profile.get("sector"),
+            "industry": profile.get("industry"),
+            "currency": price_info.get("currency"),
+        }
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
 def format_number(value):
-    """Format a number in millions with Spanish locale style."""
+    """Format a number in millions."""
     if value is None:
         return {"formatted": "N/D", "negative": False, "pct": None}
     millions = value / 1_000_000
@@ -49,116 +164,141 @@ def safe_get(df, key, col):
         return None
 
 
-def _yf_fetch_with_retry(fetch_fn, retries=3, base_wait=2):
-    """Call *fetch_fn* with retry + exponential back-off on rate-limit errors."""
-    for attempt in range(retries):
-        try:
-            return fetch_fn()
-        except Exception as exc:
-            is_rate_limit = "Too Many Requests" in str(exc) or "Rate" in str(exc)
-            if is_rate_limit and attempt < retries - 1:
-                time.sleep(base_wait * (2 ** attempt))
-                continue
-            raise
+# ---------------------------------------------------------------------------
+# Main financial-data pipeline
+# ---------------------------------------------------------------------------
+
+# Maps our display labels to every possible index name across yfinance
+# (pretty / camelCase) and the direct quoteSummary JSON keys.
+KEY_MAP = {
+    "Total Revenue": [
+        "Total Revenue", "TotalRevenue", "totalRevenue",
+    ],
+    "Cost Of Revenue": [
+        "Cost Of Revenue", "CostOfRevenue", "costOfRevenue",
+    ],
+    "Gross Profit": [
+        "Gross Profit", "GrossProfit", "grossProfit",
+    ],
+    "Operating Expense": [
+        "Operating Expense", "OperatingExpense", "totalOperatingExpenses",
+        "Total Operating Expenses", "TotalExpenses", "operatingExpense",
+    ],
+    "Operating Income": [
+        "Operating Income", "OperatingIncome", "operatingIncome",
+    ],
+    "EBITDA": [
+        "EBITDA", "Normalized EBITDA", "NormalizedEBITDA", "ebitda",
+    ],
+    "Net Income": [
+        "Net Income", "NetIncome", "netIncome",
+        "Net Income Common Stockholders", "NetIncomeCommonStockholders",
+        "netIncomeApplicableToCommonShares",
+    ],
+    "EBIT": [
+        "EBIT", "ebit",
+    ],
+    "Interest Expense": [
+        "Interest Expense", "InterestExpense", "interestExpense",
+    ],
+    "Tax Provision": [
+        "Tax Provision", "TaxProvision", "incomeTaxExpense",
+        "Income Tax Expense", "IncomeTaxExpense",
+    ],
+}
 
 
 def get_financial_data(ticker_symbol):
     """Download and process financial data from Yahoo Finance."""
-    ticker = yf.Ticker(ticker_symbol)
 
-    # Warm up the session: a lightweight history call establishes the
-    # cookies/crumb that Yahoo Finance requires before serving fundamental
-    # data.  Without this, income_stmt / financials silently return empty
-    # DataFrames in many yfinance versions.
-    try:
-        _yf_fetch_with_retry(lambda: ticker.history(period="1d"))
-    except Exception:
-        pass  # Non-fatal: the session may still work without it
-    time.sleep(1)  # Brief pause to avoid hitting Yahoo rate limits
-
-    # Try income_stmt first (pretty index), fall back to financials
     income_stmt = None
-    last_error = None
-    for fetch in [
-        lambda: ticker.income_stmt,
-        lambda: ticker.financials,
-    ]:
-        try:
-            stmt = _yf_fetch_with_retry(lambda: fetch())
-            if stmt is not None and not stmt.empty:
-                income_stmt = stmt
-                break
-        except Exception as exc:
-            last_error = exc
-            time.sleep(1)
 
+    # --- Attempt 1: yfinance library (fast if session is healthy) ----------
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        for attr in ("income_stmt", "financials"):
+            try:
+                stmt = getattr(ticker, attr)
+                if stmt is not None and not stmt.empty:
+                    income_stmt = stmt
+                    break
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # --- Attempt 2: direct Yahoo Finance API call --------------------------
     if income_stmt is None:
-        detail = f" ({last_error})" if last_error else ""
+        try:
+            income_stmt = _fetch_income_stmt_direct(ticker_symbol)
+        except Exception as exc:
+            raise RuntimeError(
+                f"No se pudieron obtener datos financieros para '{ticker_symbol}'. "
+                f"Verifica que el ticker sea correcto y que haya conexion "
+                f"a Internet. ({exc})"
+            )
+
+    if income_stmt is None or income_stmt.empty:
         raise RuntimeError(
             f"No se pudieron obtener datos financieros para '{ticker_symbol}'. "
-            f"Verifica que el ticker sea correcto y que haya conexion a Internet.{detail}"
+            "Verifica que el ticker sea correcto."
         )
 
+    # --- Company info (best-effort) ----------------------------------------
+    info = {}
     try:
-        info = _yf_fetch_with_retry(lambda: ticker.info)
+        info = getattr(ticker, "info", None) or {}
     except Exception:
-        info = {}
-    company_name = info.get("longName") or info.get("shortName") or ticker_symbol.upper()
+        pass
+    if not info.get("longName"):
+        info = {**info, **_fetch_company_info_direct(ticker_symbol)}
+
+    company_name = (
+        info.get("longName") or info.get("shortName") or ticker_symbol.upper()
+    )
     company_info = {
-        "sector": info.get("sector", "N/D"),
-        "industry": info.get("industry", "N/D"),
-        "currency": info.get("currency", "USD"),
+        "sector": info.get("sector", "N/D") or "N/D",
+        "industry": info.get("industry", "N/D") or "N/D",
+        "currency": info.get("currency", "USD") or "USD",
     }
 
+    # --- Build table rows ---------------------------------------------------
     columns = income_stmt.columns[:4]
-    years = [col.strftime("%Y") if hasattr(col, "strftime") else str(col) for col in columns]
-
-    # Map display labels to possible index names (pretty and camelCase variants)
-    key_map = {
-        "Total Revenue": ["Total Revenue", "TotalRevenue"],
-        "Cost Of Revenue": ["Cost Of Revenue", "CostOfRevenue"],
-        "Gross Profit": ["Gross Profit", "GrossProfit"],
-        "Operating Expense": ["Operating Expense", "OperatingExpense",
-                              "Total Operating Expenses", "TotalExpenses"],
-        "Operating Income": ["Operating Income", "OperatingIncome"],
-        "EBITDA": ["EBITDA", "Normalized EBITDA", "NormalizedEBITDA"],
-        "Net Income": ["Net Income", "NetIncome",
-                        "Net Income Common Stockholders", "NetIncomeCommonStockholders"],
-        "EBIT": ["EBIT"],
-        "Interest Expense": ["Interest Expense", "InterestExpense"],
-        "Tax Provision": ["Tax Provision", "TaxProvision",
-                          "Income Tax Expense", "IncomeTaxExpense"],
-    }
+    years = [
+        col.strftime("%Y") if hasattr(col, "strftime") else str(col)
+        for col in columns
+    ]
 
     def find_key(label):
-        candidates = key_map.get(label, [label])
-        for candidate in candidates:
+        for candidate in KEY_MAP.get(label, [label]):
             if candidate in income_stmt.index:
                 return candidate
         return None
 
-    rows = []
+    col_meta = []
     for col in columns:
         revenue = safe_get(income_stmt, find_key("Total Revenue"), col)
-        rows.append({"col": col, "revenue": revenue})
+        col_meta.append({"col": col, "revenue": revenue})
 
     def build_row(label, key_label, css_class="", show_pct=True):
         key = find_key(key_label)
         cells = []
-        for r in rows:
-            val = safe_get(income_stmt, key, r["col"]) if key else None
+        for cm in col_meta:
+            val = safe_get(income_stmt, key, cm["col"]) if key else None
             if show_pct:
-                cells.append(format_pct(val, r["revenue"]))
+                cells.append(format_pct(val, cm["revenue"]))
             else:
                 cells.append(format_number(val))
         return {"label": label, "cells": cells, "css_class": css_class}
 
     financial_data = [
-        build_row("Ingresos totales", "Total Revenue", css_class="subtotal", show_pct=False),
+        build_row("Ingresos totales", "Total Revenue",
+                  css_class="subtotal", show_pct=False),
         build_row("Coste de ventas", "Cost Of Revenue"),
         build_row("Margen bruto", "Gross Profit", css_class="subtotal"),
         build_row("Gastos operativos", "Operating Expense"),
-        build_row("Resultado operativo (EBIT)", "Operating Income", css_class="subtotal"),
+        build_row("Resultado operativo (EBIT)", "Operating Income",
+                  css_class="subtotal"),
         build_row("EBITDA", "EBITDA"),
         build_row("Gastos financieros", "Interest Expense"),
         build_row("Impuestos", "Tax Provision"),
@@ -186,6 +326,10 @@ def get_financial_data(ticker_symbol):
     return financial_data, years, company_name, company_info, raw_data
 
 
+# ---------------------------------------------------------------------------
+# Claude memo generation
+# ---------------------------------------------------------------------------
+
 def generate_memo(company_name, ticker_symbol, years, raw_data, currency):
     """Generate the financial memo using Anthropic's Claude API."""
     data_text = ""
@@ -194,7 +338,9 @@ def generate_memo(company_name, ticker_symbol, years, raw_data, currency):
         data_text += f"\n--- {year} ---\n"
         for concept, value in d.items():
             if value is not None:
-                data_text += f"  {concept}: {value / 1_000_000:,.1f} millones {currency}\n"
+                data_text += (
+                    f"  {concept}: {value / 1_000_000:,.1f} millones {currency}\n"
+                )
             else:
                 data_text += f"  {concept}: No disponible\n"
 
@@ -227,7 +373,12 @@ No uses formato markdown. Escribe en texto plano con párrafos separados por lí
     return message.content[0].text
 
 
-def create_word_document(company_name, ticker_symbol, memo_text, financial_data, years):
+# ---------------------------------------------------------------------------
+# Word document generation
+# ---------------------------------------------------------------------------
+
+def create_word_document(company_name, ticker_symbol, memo_text,
+                         financial_data, years):
     """Create a Word document with the financial memo."""
     doc = Document()
 
@@ -239,7 +390,7 @@ def create_word_document(company_name, ticker_symbol, memo_text, financial_data,
 
     title = doc.add_heading(level=0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title.add_run(f"Nota de Memoria Financiera")
+    run = title.add_run("Nota de Memoria Financiera")
     run.font.color.rgb = RGBColor(0x0A, 0x24, 0x63)
     run.font.size = Pt(22)
 
@@ -252,7 +403,9 @@ def create_word_document(company_name, ticker_symbol, memo_text, financial_data,
 
     date_para = doc.add_paragraph()
     date_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = date_para.add_run(f"Fecha de elaboracion: {datetime.now().strftime('%d/%m/%Y')}")
+    run = date_para.add_run(
+        f"Fecha de elaboracion: {datetime.now().strftime('%d/%m/%Y')}"
+    )
     run.font.size = Pt(10)
     run.font.color.rgb = RGBColor(0x71, 0x80, 0x96)
 
@@ -297,6 +450,10 @@ def create_word_document(company_name, ticker_symbol, memo_text, financial_data,
     return buffer
 
 
+# ---------------------------------------------------------------------------
+# Flask routes
+# ---------------------------------------------------------------------------
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     context = {"current_year": datetime.now().year}
@@ -317,10 +474,14 @@ def index():
             return render_template("index.html", **context)
 
         try:
-            financial_data, years, company_name, company_info, raw_data = get_financial_data(ticker_symbol)
+            financial_data, years, company_name, company_info, raw_data = (
+                get_financial_data(ticker_symbol)
+            )
             currency = company_info.get("currency", "USD")
 
-            memo_raw = generate_memo(company_name, ticker_symbol, years, raw_data, currency)
+            memo_raw = generate_memo(
+                company_name, ticker_symbol, years, raw_data, currency
+            )
             memo_html = memo_raw.replace("\n\n", "</p><p>").replace("\n", "<br>")
             memo_html = f"<p>{memo_html}</p>"
 
@@ -354,14 +515,19 @@ def download(ticker):
     if not memo:
         return "No hay datos disponibles. Realiza primero el analisis.", 404
 
-    buffer = create_word_document(company_name, ticker, memo, financial_data, years)
+    buffer = create_word_document(
+        company_name, ticker, memo, financial_data, years
+    )
     filename = f"Nota_Memoria_{company_name.replace(' ', '_')}_{ticker}.docx"
 
     return send_file(
         buffer,
         as_attachment=True,
         download_name=filename,
-        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        mimetype=(
+            "application/vnd.openxmlformats-officedocument"
+            ".wordprocessingml.document"
+        ),
     )
 
 
