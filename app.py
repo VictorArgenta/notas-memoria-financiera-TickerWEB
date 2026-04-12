@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import time
 from datetime import datetime
 
 import anthropic
@@ -48,6 +49,19 @@ def safe_get(df, key, col):
         return None
 
 
+def _yf_fetch_with_retry(fetch_fn, retries=3, base_wait=2):
+    """Call *fetch_fn* with retry + exponential back-off on rate-limit errors."""
+    for attempt in range(retries):
+        try:
+            return fetch_fn()
+        except Exception as exc:
+            is_rate_limit = "Too Many Requests" in str(exc) or "Rate" in str(exc)
+            if is_rate_limit and attempt < retries - 1:
+                time.sleep(base_wait * (2 ** attempt))
+                continue
+            raise
+
+
 def get_financial_data(ticker_symbol):
     """Download and process financial data from Yahoo Finance."""
     ticker = yf.Ticker(ticker_symbol)
@@ -56,7 +70,11 @@ def get_financial_data(ticker_symbol):
     # cookies/crumb that Yahoo Finance requires before serving fundamental
     # data.  Without this, income_stmt / financials silently return empty
     # DataFrames in many yfinance versions.
-    ticker.history(period="1d")
+    try:
+        _yf_fetch_with_retry(lambda: ticker.history(period="1d"))
+    except Exception:
+        pass  # Non-fatal: the session may still work without it
+    time.sleep(1)  # Brief pause to avoid hitting Yahoo rate limits
 
     # Try income_stmt first (pretty index), fall back to financials
     income_stmt = None
@@ -66,12 +84,13 @@ def get_financial_data(ticker_symbol):
         lambda: ticker.financials,
     ]:
         try:
-            stmt = fetch()
+            stmt = _yf_fetch_with_retry(lambda: fetch())
             if stmt is not None and not stmt.empty:
                 income_stmt = stmt
                 break
         except Exception as exc:
             last_error = exc
+            time.sleep(1)
 
     if income_stmt is None:
         detail = f" ({last_error})" if last_error else ""
@@ -81,7 +100,7 @@ def get_financial_data(ticker_symbol):
         )
 
     try:
-        info = ticker.info
+        info = _yf_fetch_with_retry(lambda: ticker.info)
     except Exception:
         info = {}
     company_name = info.get("longName") or info.get("shortName") or ticker_symbol.upper()
