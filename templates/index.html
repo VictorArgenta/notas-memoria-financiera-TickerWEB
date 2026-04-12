@@ -404,7 +404,7 @@
                         {% for row in financial_data %}
                         <tr class="{{ row.css_class or '' }}">
                             <td>{{ row.label }}</td>
-                            {% for val in row.values %}
+                            {% for val in row.cells %}
                             <td>
                                 <span class="{{ 'negative' if val.negative else '' }}">{{ val.formatted }}</span>
                                 {% if val.pct is not none %}
