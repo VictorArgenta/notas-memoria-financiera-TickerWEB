@@ -9,6 +9,7 @@ import urllib.parse
 from datetime import datetime
 
 import anthropic
+import google.generativeai as genai
 import pandas as pd
 import yfinance as yf
 from docx import Document
@@ -22,6 +23,19 @@ load_dotenv()
 app = Flask(__name__)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+ANTHROPIC_MODELS = {
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+}
+GEMINI_MODELS = {
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+}
+ALLOWED_MODELS = ANTHROPIC_MODELS | GEMINI_MODELS
+DEFAULT_MODEL = "claude-sonnet-4-6"
 
 
 # ---------------------------------------------------------------------------
@@ -330,8 +344,7 @@ def get_financial_data(ticker_symbol):
 # Claude memo generation
 # ---------------------------------------------------------------------------
 
-def generate_memo(company_name, ticker_symbol, years, raw_data, currency):
-    """Generate the financial memo using Anthropic's Claude API."""
+def _build_memo_prompt(company_name, ticker_symbol, years, raw_data, currency):
     data_text = ""
     for year in years:
         d = raw_data[year]
@@ -344,7 +357,7 @@ def generate_memo(company_name, ticker_symbol, years, raw_data, currency):
             else:
                 data_text += f"  {concept}: No disponible\n"
 
-    prompt = f"""Eres un analista financiero profesional. Redacta una nota de memoria financiera en español
+    return f"""Eres un analista financiero profesional. Redacta una nota de memoria financiera en español
 con lenguaje formal contable sobre la empresa {company_name} (ticker: {ticker_symbol}).
 
 Utiliza los siguientes datos reales de la cuenta de pérdidas y ganancias:
@@ -363,14 +376,49 @@ Usa formato profesional con párrafos bien estructurados. Incluye cifras concret
 de variación interanual. Redacta en un tono formal adecuado para una memoria anual corporativa.
 No uses formato markdown. Escribe en texto plano con párrafos separados por líneas en blanco."""
 
+
+def _generate_with_anthropic(prompt, model):
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError(
+            "No se ha configurado la API key de Anthropic. "
+            "Crea un archivo .env con ANTHROPIC_API_KEY=tu_clave"
+        )
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=model,
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
     )
-
     return message.content[0].text
+
+
+def _generate_with_gemini(prompt, model):
+    if not GOOGLE_API_KEY:
+        raise RuntimeError(
+            "No se ha configurado la API key de Google. "
+            "Crea un archivo .env con GOOGLE_API_KEY=tu_clave"
+        )
+    genai.configure(api_key=GOOGLE_API_KEY)
+    gemini_model = genai.GenerativeModel(model)
+    response = gemini_model.generate_content(
+        prompt,
+        generation_config={"max_output_tokens": 4096},
+    )
+    return response.text
+
+
+def generate_memo(company_name, ticker_symbol, years, raw_data, currency, model):
+    """Generate the financial memo using the selected AI provider."""
+    if model not in ALLOWED_MODELS:
+        raise RuntimeError(f"Modelo no soportado: {model}")
+
+    prompt = _build_memo_prompt(
+        company_name, ticker_symbol, years, raw_data, currency
+    )
+
+    if model in ANTHROPIC_MODELS:
+        return _generate_with_anthropic(prompt, model)
+    return _generate_with_gemini(prompt, model)
 
 
 # ---------------------------------------------------------------------------
@@ -456,21 +504,21 @@ def create_word_document(company_name, ticker_symbol, memo_text,
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    context = {"current_year": datetime.now().year}
+    context = {
+        "current_year": datetime.now().year,
+        "selected_model": DEFAULT_MODEL,
+    }
 
     if request.method == "POST":
         ticker_symbol = request.form.get("ticker", "").strip().upper()
+        model = request.form.get("model", DEFAULT_MODEL).strip()
+        if model not in ALLOWED_MODELS:
+            model = DEFAULT_MODEL
         context["ticker"] = ticker_symbol
+        context["selected_model"] = model
 
         if not ticker_symbol:
             context["error"] = "Por favor, introduce un ticker valido."
-            return render_template("index.html", **context)
-
-        if not ANTHROPIC_API_KEY:
-            context["error"] = (
-                "No se ha configurado la API key de Anthropic. "
-                "Crea un archivo .env con ANTHROPIC_API_KEY=tu_clave"
-            )
             return render_template("index.html", **context)
 
         try:
@@ -480,7 +528,7 @@ def index():
             currency = company_info.get("currency", "USD")
 
             memo_raw = generate_memo(
-                company_name, ticker_symbol, years, raw_data, currency
+                company_name, ticker_symbol, years, raw_data, currency, model
             )
             memo_html = memo_raw.replace("\n\n", "</p><p>").replace("\n", "<br>")
             memo_html = f"<p>{memo_html}</p>"
