@@ -70,6 +70,12 @@
             margin-bottom: 2rem;
         }
 
+        .card.sticky-form {
+            position: sticky;
+            top: 1rem;
+            z-index: 50;
+        }
+
         .card h2 {
             color: #0a2463;
             font-size: 1.25rem;
@@ -352,6 +358,10 @@
                 gap: 0.8rem;
             }
 
+            .card.sticky-form {
+                position: static;
+            }
+
             .search-form {
                 flex-direction: column;
             }
@@ -389,9 +399,9 @@
         <div class="alert alert-error">{{ error }}</div>
         {% endif %}
 
-        <div class="card">
+        <div class="card sticky-form">
             <h2>Consultar empresa</h2>
-            <form method="POST" action="/" class="search-form" onsubmit="document.getElementById('loadingOverlay').classList.add('active');">
+            <form id="analysis-form" method="POST" action="/" class="search-form" onsubmit="document.getElementById('loadingOverlay').classList.add('active');">
                 <div class="form-group">
                     <label for="ticker">Ticker de la empresa</label>
                     <input type="text" id="ticker" name="ticker" placeholder="Ej: AAPL, MSFT, TSLA, BBVA.MC"
@@ -399,7 +409,7 @@
                 </div>
                 <div class="form-group">
                     <label for="model">Modelo de IA</label>
-                    <select id="model" name="model">
+                    <select id="model" name="model" required>
                         <optgroup label="Anthropic Claude (de pago)">
                             <option value="claude-opus-4-6" {% if selected_model == 'claude-opus-4-6' %}selected{% endif %}>claude-opus-4-6 — Máxima calidad</option>
                             <option value="claude-sonnet-4-6" {% if selected_model == 'claude-sonnet-4-6' %}selected{% endif %}>claude-sonnet-4-6 — Recomendado</option>
